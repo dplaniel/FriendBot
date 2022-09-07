@@ -3,6 +3,7 @@ from discord.ext import commands
 import asyncio
 from random import randint
 import os
+import unicodedata
 
 from friendbot_config import FRIENDBOT_TOKEN, PRIVILEGED_USERS, STABLEDIFFUSION_LOCATION
 
@@ -48,7 +49,9 @@ async def run_stable_diffusion(
     seed=None,
     n_samples=1,
     n_iter=1,
-    scale=7.5,
+    scale=7.2,
+    ddim_steps=64,
+    plms=True,
     label=False,
     outdir="/data/big/sdiff_images/friendbot",
     skip_grid=True,
@@ -66,6 +69,8 @@ async def run_stable_diffusion(
         n_samples : int, Batch size for txt2img.py
         n_iter : int, number of batched repetitions to run in txt2img.py
         scale : float, CFG scale factor for sampling method in txt2img.py
+        ddim_steps : int, number of steps in txt2img.py
+        plms : bool, flag for whether or not to use plms sampling in txt2img.py
         label : bool, flag for img metadata bottom banner on txt2img.py output
             (requires custom fork of stable-diffusion...)
         outdir : str, path to output location
@@ -73,9 +78,12 @@ async def run_stable_diffusion(
     Returns:
         str : Path to output .png location
     """
+    safe_prompt = (
+        unicodedata.normalize("NFKD", prompt).encode("ascii", "replace").decode()
+    )
 
-    if (seed is None) or (seed not in range(1, 32000)):
-        seed = randint(1, 32000)
+    if (seed is None) or (seed not in range(1, 64000)):
+        seed = randint(1, 64000)
     ldm_python_path = os.path.abspath(
         os.path.expandvars("$HOME/anaconda3/envs/ldm/bin/python")
     )
@@ -85,18 +93,22 @@ async def run_stable_diffusion(
         "ignore",
         f"{STABLEDIFFUSION_LOCATION}/scripts/txt2img.py",
         "--prompt",
-        prompt,
+        safe_prompt,
         "--n_samples",
-        str(n_samples),
+        str(int(n_samples)),
         "--seed",
-        str(seed),
+        str(int(seed)),
         "--n_iter",
-        str(n_iter),
+        str(int(n_iter)),
         "--scale",
         str(scale),
+        "--ddim_steps",
+        str(int(ddim_steps)),
         "--outdir",
         outdir,
     ]
+    if plms:
+        sd_cmd.append("--plms")
     if label:
         sd_cmd.append("--label")
     if skip_grid:
@@ -120,9 +132,13 @@ async def run_stable_diffusion(
 
     # if stderr: # Python shits all of its warnings out onto stderr, so...
     #    raise OSError(stderr.decode())
-    assert (
-        proc.returncode == 0
-    ), f"Stable diffusion returned with non-zero exit code {proc.returncode}"
+    if proc.returncode != 0:
+        print(f"Stable diffusion returned with non-zero exit code {proc.returncode}")
+        with open("err_logs.txt", "w+") as errfile:
+            errfile.write(f"{next_idx}: {prompt}")
+            errfile.write(f"\t {proc.returncode}")
+            errfile.write(f"\t {stderr.decode()}")
+            errfile.write(("\n"))
 
     imgfile = os.path.join(outdir, "samples", f"{next_idx}.png")
 
@@ -139,7 +155,7 @@ async def run_stable_diffusion(
 @bot.command()
 async def lonely(ctx):
     # First check if there is enough GPU Memory and power available:
-    is_gpu_available = await check_gpu_availability()
+    is_gpu_available = await check_gpu_availability(3200)
     if not is_gpu_available:
         await ctx.send(
             f"I need a lot of free GPU memory to do that, and it looks like there isn't enough to go around.  Try again later."
@@ -168,8 +184,11 @@ async def artistic(ctx, *, prompt):
     if prompt.endswith('"'):
         prompt = prompt[:-1]
     imgpath = await run_stable_diffusion(prompt, label=True)  # label=False)
-    imgfile = discord.File(imgpath)
-    await ctx.reply("How's this?", file=imgfile)
+    if imgpath is not None:
+        imgfile = discord.File(imgpath)
+        await ctx.reply("How's this?", file=imgfile)
+    else:
+        await ctx.reply("I think something went wrong, sorry.")
 
 
 bot.run(FRIENDBOT_TOKEN)
