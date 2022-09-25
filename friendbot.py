@@ -1,14 +1,13 @@
 import discord
-from discord.ext import commands
+from discord.ext import tasks, commands
 import asyncio
-from random import randint
+from random import randint, choice
 import os
 import unicodedata
+from collections import defaultdict
 
 from friendbot_config import FRIENDBOT_TOKEN, PRIVILEGED_USERS, STABLEDIFFUSION_LOCATION
-
-# Create Bot object from Discord Commands API
-bot = commands.Bot(command_prefix="!")
+from dialog import channel_slowdown, channel_queue_full, user_at_cap, snarky_channel_slowdowns, snarky_usercaps
 
 
 async def run_cmd(cmd):
@@ -79,11 +78,13 @@ async def run_stable_diffusion(
         str : Path to output .png location
     """
     safe_prompt = (
-        unicodedata.normalize("NFKD", prompt).encode("ascii", "replace").decode()
+        unicodedata.normalize("NFKD", prompt).encode(
+            "ascii", "replace").decode()
     )
 
-    if (seed is None) or (seed not in range(1, 64000)):
-        seed = randint(1, 64000)
+    if (seed is None) or (not isinstance(seed, int)):
+        seed = randint(1, 2**63-1)
+    seed = max(0, min(seed, 2**63-1))
     ldm_python_path = os.path.abspath(
         os.path.expandvars("$HOME/anaconda3/envs/ldm/bin/python")
     )
@@ -133,8 +134,9 @@ async def run_stable_diffusion(
     # if stderr: # Python shits all of its warnings out onto stderr, so...
     #    raise OSError(stderr.decode())
     if proc.returncode != 0:
-        print(f"Stable diffusion returned with non-zero exit code {proc.returncode}")
-        with open("err_logs.txt", "w+") as errfile:
+        print(
+            f"Stable diffusion returned with non-zero exit code {proc.returncode}")
+        with open("err_logs.txt", "a") as errfile:
             errfile.write(f"{next_idx}: {prompt}")
             errfile.write(f"\t {proc.returncode}")
             errfile.write(f"\t {stderr.decode()}")
@@ -152,43 +154,137 @@ async def run_stable_diffusion(
         return None
 
 
-@bot.command()
-async def lonely(ctx):
-    # First check if there is enough GPU Memory and power available:
-    is_gpu_available = await check_gpu_availability(3200)
-    if not is_gpu_available:
-        await ctx.send(
-            f"I need a lot of free GPU memory to do that, and it looks like there isn't enough to go around.  Try again later."
-        )
-    else:
-        await ctx.send("Sorry, `!lonely` is not implemented yet.")
+class TextGenerationCog(commands.Cog):
+    # TODO: Language model text generation -- the real puzzle here is GPU
+    # resource balancing between this task and the Image task...
+    def __init__(self, bot):
+        pass
+
+    @commands.command()
+    async def lonely(ctx):
+        # First check if there is enough GPU Memory and power available:
+        is_gpu_available = await check_gpu_availability(3200)
+        if not is_gpu_available:
+            await ctx.send(
+                f"I need a lot of free GPU memory to do that, and it looks like there isn't enough to go around.  Try again later."
+            )
+        else:
+            await ctx.send("Sorry, `!lonely` is not implemented yet.")
 
 
-@bot.command()
-async def artistic(ctx, *, prompt):
-    if (
-        not ctx.channel.name == "artism-spectrum"
-    ):  # temporary hack while I think of a better way to specify by channel id
-        return
-    # First check if there is enough GPU Memory and power available:
-    is_gpu_available = await check_gpu_availability()
-    if not is_gpu_available:
-        await ctx.reply(
-            f"I need a lot of free GPU memory to do that, and it looks like there isn't enough to go around.  Try again later."
-        )
-        return
-    else:
-        await ctx.reply("Okay, give me a minute to try to draw that!")
-    if prompt.startswith('"'):
-        prompt = prompt[1:]
-    if prompt.endswith('"'):
-        prompt = prompt[:-1]
-    imgpath = await run_stable_diffusion(prompt, label=True)  # label=False)
-    if imgpath is not None:
-        imgfile = discord.File(imgpath)
-        await ctx.reply("How's this?", file=imgfile)
-    else:
-        await ctx.reply("I think something went wrong, sorry.")
+class ImageGenerationCog(commands.Cog):
+    """
+    Cog to add Stable Diffusion txt2img.py Image Generation
+    to a discord bot.
+
+    Holds queue of user prompts in a prompt_queue.
+    Bots with this cog will asynchronously spawn up to
+    one python subprocess to run txt2img.py and process
+    prompts.
+
+    Users may submit prompts through the command interface
+    via
+        $artistic <user_prompt_here>
+
+    Bots with this cog will reply directly to the message
+    creating the prompt when the image is ready
+    """
+
+    def __init__(self, bot, max_queue_size=99, delete_images=False, snarky=True):
+        """
+        ImageGenerationCog Constructor
+
+        Args:
+            bot: commands.Bot Object
+                Bot instance this Cog will be injected into
+            max_queue_size: int, optional
+                Max number of prompts in queue, defaults to 99
+            delete_images : bool, optional
+                Set this flag to True if you want to delete
+                Stable Diffusion output images after they are
+                uploaded to preserve disk space
+            snarky: bool, optional
+                Gives users snarky slowdown messages when they
+                hit their prompt cap or the queue fills
+        """
+        self.bot = bot
+        self.prompt_queue = asyncio.Queue(max_queue_size)
+        self.retrieve_prompt_from_queue.start()
+        self.delete_images = delete_images
+        self.user_prompt_counts = defaultdict(lambda: 0)
+        self.snarky = snarky
+        self.slow_cap = .50
+
+    @tasks.loop(seconds=0.25)
+    async def retrieve_prompt_from_queue(self):
+        """
+        Retrieve prompts to run from queue, looped
+        """
+        (ctx, prompt) = await self.prompt_queue.get()  # Should wait until job is available
+        self.user_prompt_counts[ctx.author] -= 1
+        # First check if there is enough GPU Memory available:
+        is_gpu_available = await check_gpu_availability()
+        if not is_gpu_available:
+            await ctx.reply(
+                f"I need a lot of free GPU memory to do that, and it looks like there isn't enough to go around right now.  Try again later."
+            )
+            await asyncio.sleep(0.1)
+            return
+        imgpath = await run_stable_diffusion(prompt, label=True)
+        if imgpath is not None:
+            imgfile = discord.File(imgpath)
+            await ctx.reply("How's this?", file=imgfile)
+            if self.delete_images:
+                os.remove(imgpath)
+        else:
+            await ctx.reply("I think something went wrong, sorry.")
+
+    @commands.command()
+    async def artistic(self, ctx, *, prompt):
+        # Check we are in allowed channel
+        if (
+            not ctx.channel.name == "artism-spectrum"
+        ):  # temporary hack while I think of a better way to specify by channel id
+            return
+        # Check there is space in the queue
+        if self.prompt_queue.full():
+            await ctx.reply(channel_queue_full)
+            return
+        # Clean prompt -- Remove trailing whitespace and quotes
+        prompt = prompt.strip(" \t\n\'\"")
+        # Check against per-user prompt caps
+        usr_ct = self.user_prompt_counts[ctx.author]
+        if usr_ct > 5:
+            if self.snarky:
+                reply = choice(snarky_usercaps).format(
+                    member=ctx.author, plus_delimited_prompt="+".join(prompt.split()))
+            else:
+                reply = user_at_cap.format(member=ctx.author, usercap=5)
+            await ctx.reply(reply)
+            return
+        await ctx.reply(f"Okay, I have {self.prompt_queue.qsize()+1} prompt(s) in the queue. {usr_ct+1} from {ctx.author}.")
+        self.user_prompt_counts[ctx.author] += 1
+        # Slowdown warning if approaching prompt limit
+        if self.prompt_queue.qsize() >= int(self.slow_cap * self.prompt_queue.maxsize):
+            if self.snarky:
+                reply = choice(snarky_channel_slowdowns).format(n_slow_cap=int(
+                    self.slow_cap*self.prompt_queue.maxsize), cmd_prefix=self.bot.command_prefix)
+            else:
+                reply = channel_slowdown.format(
+                    slow_cap=int(100*self.slow_cap))
+            await ctx.channel.send(reply)
+        try:
+            self.prompt_queue.put_nowait((ctx, prompt))
+        except QueueFull:
+            ctx.reply(channel_queue_full)
 
 
-bot.run(FRIENDBOT_TOKEN)
+if __name__ == "__main__":
+
+    # Create bot and add our
+    friendbot = commands.Bot(command_prefix="!")
+    friendbot.add_cog(ImageGenerationCog(
+        friendbot, snarky=True, max_queue_size=16))
+
+    # bot.run() is blocking and must be run last
+    friendbot.run(FRIENDBOT_TOKEN)
